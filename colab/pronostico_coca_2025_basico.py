@@ -5,8 +5,10 @@
 # regresión lineal, regresión polinómica, Holt y ARIMA.
 #
 # **¿Cómo elegimos el mejor?** Hacemos una "prueba en el pasado": cada modelo pronostica los años
-# 2019 a 2024 usando sólo los años anteriores, y medimos cuánto se equivocó (MAE y RMSE).
-# Probamos cada modelo con ventanas de **3, 5 y 10 años** de historia.
+# anteriores usando sólo los años previos a cada uno, y medimos cuánto se equivocó (MAE y RMSE).
+# Probamos cada modelo con ventanas de **3, 5 y 10 años** de historia (las que permitan los datos).
+#
+# **Punto de partida:** el dataframe `fact_cultivos_raw` del notebook de limpieza.
 #
 # **ARIMA** tiene tres números (p, d, q). Probamos todas las combinaciones y nos quedamos con la mejor.
 
@@ -26,39 +28,27 @@ warnings.filterwarnings("ignore")  # statsmodels avisa mucho con series cortas
 
 # %%
 # ============================================================
-# 2. CARGAR LOS DATOS DESDE DRIVE
+# 2. PARTIR DE fact_cultivos_raw (ya cargado en el notebook de limpieza)
 # ============================================================
-from google.colab import drive
-drive.mount("/content/drive")
+# Ejecuta antes el notebook de limpieza para que fact_cultivos_raw exista en memoria.
+# Columnas esperadas: cod_municipio | anio | hectareas_coca
+print(f"fact_cultivos_raw: {len(fact_cultivos_raw):,} filas | "
+      f"años {fact_cultivos_raw['anio'].min()}-{fact_cultivos_raw['anio'].max()}")
 
-RUTA_COCA = "/content/drive/MyDrive/Proyecto_Policia/Datos/Detección_de_Cultivos_de_Coca_(hectáreas)_20260831.csv"
+ANIO_PRONOSTICO = 2025
 
-
-def parsear_hectareas(valor):
-    """Convierte el texto a número. Corrige el año 2020, que viene como '8.832,92'."""
-    if pd.isna(valor) or str(valor).strip() == "":
-        return 0.0
-    texto = str(valor).strip()
-    if "," in texto:                                  # formato europeo: 8.832,92 -> 8832.92
-        texto = texto.replace(".", "").replace(",", ".")
-    return float(texto)
-
-
-df_coca_file = pd.read_csv(RUTA_COCA, dtype=str)
-df_coca_file.columns = df_coca_file.columns.str.strip().str.upper()
-df_coca_file["cod_municipio"] = df_coca_file["CODMPIO"].str.zfill(5)
-
-# Formato largo: una fila por municipio y año (todos los años disponibles, 2001-2024)
-columnas_anio = [c for c in df_coca_file.columns if c.isdigit()]
-fact_cultivos_raw = df_coca_file.melt(id_vars="cod_municipio", value_vars=columnas_anio,
-                                      var_name="anio", value_name="valor")
-fact_cultivos_raw["anio"] = fact_cultivos_raw["anio"].astype(int)
-fact_cultivos_raw["hectareas_coca"] = fact_cultivos_raw["valor"].apply(parsear_hectareas)
-fact_cultivos_raw = fact_cultivos_raw[["cod_municipio", "anio", "hectareas_coca"]]
-
-# Serie del TOTAL NACIONAL: suma de todos los municipios por año
+# Serie del TOTAL NACIONAL: suma de todos los municipios por año (sólo años anteriores a 2025)
 serie = fact_cultivos_raw.groupby("anio")["hectareas_coca"].sum()
+serie = serie[serie.index < ANIO_PRONOSTICO]
 print(serie.round(0))
+
+# Control de calidad: ¿algún año cae a menos de la mitad de sus vecinos? (pasa con 2020 si
+# parsear_hectareas no reconoce el formato "8.832,92")
+for anio in serie.index[1:-1]:
+    vecinos = (serie.loc[anio - 1] + serie.loc[anio + 1]) / 2
+    if serie.loc[anio] < 0.5 * vecinos:
+        print(f"⚠️ {anio}: {serie.loc[anio]:,.0f} ha, muy por debajo de sus años vecinos (~{vecinos:,.0f} ha). "
+              "Revisa parsear_hectareas en el notebook de limpieza.")
 
 # %%
 # ============================================================
@@ -73,11 +63,27 @@ plt.show()
 
 # %%
 # ============================================================
-# 4. PARÁMETROS DE LA PRUEBA
+# 4. PARÁMETROS DE LA PRUEBA (se ajustan a los años disponibles)
 # ============================================================
-VENTANAS = [3, 5, 10]                    # años de historia que ve cada modelo
-ANIOS_PRUEBA = list(range(2019, 2025))   # años que pronosticamos "en el pasado" para medir el error
-ANIO_PRONOSTICO = 2025
+# Para probar una ventana de N años necesitamos N años de historia ANTES de cada año de prueba.
+# Exigimos al menos 2 años de prueba por ventana; si no alcanzan los datos, la ventana se omite.
+VENTANAS_DESEADAS = [3, 5, 10]
+MIN_ANIOS_PRUEBA = 2
+MAX_ANIOS_PRUEBA = 6                      # como máximo probamos los últimos 6 años (2019-2024)
+
+primer_anio, ultimo_anio = serie.index.min(), serie.index.max()
+VENTANAS = [v for v in VENTANAS_DESEADAS if ultimo_anio - (primer_anio + v) + 1 >= MIN_ANIOS_PRUEBA]
+omitidas = [v for v in VENTANAS_DESEADAS if v not in VENTANAS]
+
+# Todas las ventanas se evalúan en los MISMOS años para que la comparación sea justa
+inicio_prueba = max(primer_anio + max(VENTANAS), ultimo_anio - MAX_ANIOS_PRUEBA + 1)
+ANIOS_PRUEBA = list(range(inicio_prueba, ultimo_anio + 1))
+
+print(f"Ventanas evaluadas: {VENTANAS}")
+print(f"Años de prueba: {ANIOS_PRUEBA[0]}-{ANIOS_PRUEBA[-1]} ({len(ANIOS_PRUEBA)} años)")
+if omitidas:
+    print(f"⚠️ Ventanas omitidas por falta de historia: {omitidas}. fact_cultivos_raw empieza en {primer_anio}; "
+          f"para usarlas, carga desde 2001 en el notebook de limpieza: range(2001, 2026).")
 
 # %%
 # ============================================================
@@ -150,7 +156,10 @@ def modelo_polinomico(y, ventana):
 
 def modelo_holt(y, ventana):
     """Suavizado exponencial de Holt: sigue el nivel y la tendencia recientes."""
-    return Holt(y, initialization_method="estimated").fit().forecast(1)[0]
+    try:
+        return Holt(y, initialization_method="estimated").fit().forecast(1)[0]
+    except Exception:
+        return modelo_lineal(y, ventana)     # respaldo si la serie es demasiado corta
 
 
 def modelo_arima(y, ventana):
@@ -196,8 +205,8 @@ print(f"\n🏆 Mejor: {MEJOR_MODELO} con {MEJOR_VENTANA} años (MAE = {mejor['MA
 # 8. GRÁFICO: COMPARACIÓN DE ERRORES
 # ============================================================
 tabla_mae = tabla_errores.pivot(index="modelo", columns="ventana", values="MAE")
-tabla_mae.plot(kind="bar", figsize=(9, 4), color=["#86b6ef", "#2a78d6", "#104281"], rot=0)
-plt.title("Error promedio (MAE) al pronosticar 2019-2024 – menor es mejor")
+tabla_mae.plot(kind="bar", figsize=(9, 4), color=["#86b6ef", "#2a78d6", "#104281"][:len(VENTANAS)], rot=0)
+plt.title(f"Error promedio (MAE) al pronosticar {ANIOS_PRUEBA[0]}-{ANIOS_PRUEBA[-1]} – menor es mejor")
 plt.ylabel("Hectáreas")
 plt.xlabel("")
 plt.legend(title="Ventana (años)")
@@ -211,7 +220,7 @@ plt.show()
 colores = {"Regresión lineal": "#2a78d6", "Regresión polinómica": "#eb6834",
            "Holt": "#1baf7a", "ARIMA": "#eda100"}
 plt.figure(figsize=(10, 4))
-plt.plot(serie.loc[2012:].index, serie.loc[2012:].values, marker="o", color="black", label="Real")
+plt.plot(serie.loc[ultimo_anio - 12:].index, serie.loc[ultimo_anio - 12:].values, marker="o", color="black", label="Real")
 for nombre in MODELOS:
     d = prueba[(prueba["modelo"] == nombre) & (prueba["ventana"] == MEJOR_VENTANA)]
     plt.plot(d["anio"], d["pronostico"], marker="o", color=colores[nombre], label=nombre)
